@@ -1,0 +1,141 @@
+trigger:
+  branches:
+    include: [ main ]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: jfrog-vars
+
+stages:
+# ---------- 1. BUILD: dependencies come through JFrog ----------
+- stage: Build
+  jobs:
+  - job: BuildTest
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+
+    - script: |
+        ENC_USER=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$(JFROG_USER)")
+        mkdir -p ~/.config/pip
+        printf "[global]\nindex-url = https://%s:$(JFROG_TOKEN)@$(JFROG_URL)/artifactory/api/pypi/pypi-virtual/simple\n" "$ENC_USER" > ~/.config/pip/pip.conf
+      displayName: Point pip at JFrog virtual repo
+
+    - script: pip install -r requirements-dev.txt
+      displayName: Install dependencies through JFrog
+
+    - script: pytest -q
+      displayName: Run tests
+
+    - script: |
+        sed -i 's/^version = .*/version = "1.0.$(Build.BuildId)"/' pyproject.toml
+        python -m build
+        ls -l dist
+      displayName: Stamp unique version and build wheel
+
+    - script: |
+        mkdir -p wheels
+        pip download -r requirements.txt -d wheels
+        cp dist/*.whl wheels/
+        ls wheels
+      displayName: Collect wheels for the image
+
+    - publish: dist
+      artifact: dist
+    - publish: wheels
+      artifact: wheels
+
+# ---------- 2. PUBLISH: push wheel, image, bundle + build info ----------
+- stage: Publish
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: Publish
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.12'
+
+    - download: current
+      artifact: dist
+    - download: current
+      artifact: wheels
+
+    - script: |
+        pip install twine
+        twine upload \
+          --repository-url https://$(JFROG_URL)/artifactory/api/pypi/pypl-local \
+          -u $(JFROG_USER) -p $(JFROG_TOKEN) \
+          $(Pipeline.Workspace)/dist/*
+      displayName: PUSH wheel to pypl-local
+
+    - script: |
+        mkdir -p wheels
+        cp $(Pipeline.Workspace)/wheels/* wheels/
+        IMG=$(JFROG_URL)/docker-trial/invoice-service
+        echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+        docker build --build-arg BUILD_NUMBER=$(Build.BuildId) -t $IMG:$(Build.BuildId) .
+        docker push $IMG:$(Build.BuildId)
+      displayName: PUSH image to docker-trial
+
+    - script: |
+        curl -fL https://install-cli.jfrog.io | sh
+        jf config add trial --url=https://$(JFROG_URL) --user=$(JFROG_USER) --access-token=$(JFROG_TOKEN) --interactive=false
+        jf rt ping
+      displayName: Install and configure JFrog CLI
+
+    - script: |
+        mkdir -p release
+        cp $(Pipeline.Workspace)/dist/*.whl release/
+        ls wheels | sort > release/dependencies.txt
+        echo "build=$(Build.BuildId) commit=$(Build.SourceVersion) date=$(date -u +%FT%TZ)" > release/build-info.txt
+        tar czf invoice-service-$(Build.BuildId).tar.gz release
+        jf rt upload "invoice-service-$(Build.BuildId).tar.gz" "generic-local/invoice-service/$(Build.BuildId)/" \
+          --flat=true --build-name=invoice-service --build-number=$(Build.BuildId)
+        jf rt build-collect-env invoice-service $(Build.BuildId)
+        jf rt build-publish invoice-service $(Build.BuildId)
+      displayName: PUSH release bundle and publish build info
+
+# ---------- 3. VERIFY: smoke test the pushed image ----------
+- stage: Verify
+  dependsOn: Publish
+  condition: succeeded()
+  jobs:
+  - job: Smoke
+    steps:
+    - script: |
+        IMG=$(JFROG_URL)/docker-trial/invoice-service
+        echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+        docker pull $IMG:$(Build.BuildId)
+        docker run -d -p 8000:8000 --name inv $IMG:$(Build.BuildId)
+        sleep 10
+        curl -s http://localhost:8000/version | tee version.json
+        grep '"$(Build.BuildId)"' version.json
+        curl -s http://localhost:8000/invoice/100 || { docker logs inv; exit 1; }
+      displayName: Pull pushed image and test it
+
+# ---------- 4. PROMOTE: only tested builds ----------
+- stage: Promote
+  dependsOn: Verify
+  condition: succeeded()
+  jobs:
+  - job: Promote
+    steps:
+    - script: |
+        IMG=$(JFROG_URL)/docker-trial/invoice-service
+        echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+        docker pull $IMG:$(Build.BuildId)
+        docker tag $IMG:$(Build.BuildId) $IMG:released
+        docker push $IMG:released
+      displayName: Tag image as released
+
+    - script: |
+        curl -fL https://install-cli.jfrog.io | sh
+        jf config add trial --url=https://$(JFROG_URL) --user=$(JFROG_USER) --access-token=$(JFROG_TOKEN) --interactive=false
+        jf rt build-promote invoice-service $(Build.BuildId) generic-release \
+          --status=released --comment="Passed smoke test" --copy=true
+        jf rt set-props "generic-release/invoice-service/$(Build.BuildId)/*" "status=released;team=billing"
+      displayName: Promote build in JFrog

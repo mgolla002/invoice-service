@@ -1,0 +1,38 @@
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: jfrog-vars
+
+steps:
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: '3.12'
+
+- script: |
+    ENC_USER=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$(JFROG_USER)")
+    pip install invoice-service \
+      --index-url "https://${ENC_USER}:$(JFROG_TOKEN)@$(JFROG_URL)/artifactory/api/pypi/pypi-virtual/simple"
+    pip show invoice-service
+  displayName: PULL wheel from the virtual repo
+
+- script: |
+    curl -fL https://install-cli.jfrog.io | sh
+    jf config add trial --url=https://$(JFROG_URL) --user=$(JFROG_USER) --access-token=$(JFROG_TOKEN) --interactive=false
+    jf rt download "generic-release/invoice-service/*" released-bundle/ --flat=false
+    find released-bundle -type f
+    jf rt search "pypi-remote-cache/*" --limit=10
+  displayName: PULL released bundle and show cached dependencies
+
+- script: |
+    IMG=$(JFROG_URL)/docker-trial/invoice-service
+    echo "$(JFROG_TOKEN)" | docker login $(JFROG_URL) -u $(JFROG_USER) --password-stdin
+    docker pull $IMG:released
+    docker run -d -p 8000:8000 --name inv $IMG:released
+    sleep 10
+    curl -s http://localhost:8000/version
+    echo
+    curl -s http://localhost:8000/invoice/250 || { docker logs inv; exit 1; }
+  displayName: PULL released image and run it
