@@ -8,7 +8,7 @@ def test_home():
 def test_invoice_total():
     r = app.test_client().get("/invoice/100")
     assert r.status_code == 200
-    assert r.get_json()["total"] == 108.25
+    assert r.get_json()["total"] == 109
 
 
 def test_invalid_amount():

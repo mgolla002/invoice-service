@@ -5,7 +5,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-TAX_RATE = 0.0825
+TAX_RATE = 0.09
 VERSION = os.getenv("APP_VERSION", "dev")
 
 
